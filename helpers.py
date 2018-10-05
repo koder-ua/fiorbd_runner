@@ -1,3 +1,4 @@
+import sys
 import json
 import time
 import subprocess
@@ -39,10 +40,24 @@ def ceph_health_ok():
     return json.loads(health_js)['health']['status'] == 'HEALTH_OK'
 
 
+def ceph_health_no_degraded():
+    health_js = subprocess.check_output('ceph status -f json', shell=True)
+    return json.loads(health_js)['health']['status'] == 'HEALTH_OK'
+
+
 def wait_ok_status():
     print("    Waiting for cluster to be healthy", end="")
     timeouts = [1] * 10
     while not ceph_health_ok():
+        time.sleep(timeouts.pop() if timeouts else 10)
+        print(".", end="")
+    print(" OK")
+
+
+def wait_no_degraded():
+    print("    Waiting for rebalance to complete", end="")
+    timeouts = [1] * 10
+    while not ceph_health_no_degraded():
         time.sleep(timeouts.pop() if timeouts else 10)
         print(".", end="")
     print(" OK")
@@ -64,8 +79,9 @@ def set_class(osd_id, osd_class):
 
 def main():
     wait_ok_status()
-    tree = get_osd_tree()
-    osds_to_move = list(iter_osds(tree))[:10]
+    # tree = get_osd_tree()
+    # osds_to_move = list(iter_osds(tree))[:10]
+    osds_to_move = list(map(int, open(sys.argv[1]).read().split()))
     first = True
     print("Total {} osds will be moved".format(len(osds_to_move)))
     for node_name, osd_id in osds_to_move:
@@ -78,7 +94,7 @@ def main():
         wait_ok_status()
         remove_class(osd_id)
         wait_ok_status()
-        set_class(osd_id, 'sata-test')
+        set_class(osd_id, 'sata2')
         wait_ok_status()
 
 

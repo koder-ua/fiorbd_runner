@@ -1,6 +1,7 @@
 import contextlib
 import sys
 import time
+import enum
 import json
 import shutil
 import argparse
@@ -9,16 +10,48 @@ import datetime
 import subprocess
 from pathlib import Path
 from threading import Event, Thread
-
-from typing import List, Any, Generator
+from typing import List, Any, Generator, Set, Dict, Iterator
 
 
 def ceph_health_ok():
     try:
-        health_js = subprocess.check_output('ceph status -f json', shell=True, timeout=5).decode("utf-8")
+        health_js = subprocess.check_output('ceph status -f json', shell=True, timeout=10).decode("utf-8")
         return json.loads(health_js)['health']['status'] == 'HEALTH_OK'
     except TimeoutError:
         return False
+
+
+def no_recovery():
+    health_js = subprocess.check_output('ceph status -f json', shell=True, timeout=15).decode("utf-8")
+    return "PG_DEGRADED" not in json.loads(health_js)['health']['checks']
+
+
+class CephHealthChecks(enum.Enum):
+    PG_DEGRADED = 0
+    PG_AVAILABILITY = 1
+
+
+def ceph_errs() -> Set[CephHealthChecks]:
+    health_js = subprocess.check_output(['ceph', 'health', 'detail', '-f', 'json'], timeout=5).decode("utf-8")
+    return {getattr(CephHealthChecks, tp) for tp in json.loads(health_js)['checks']}
+
+
+class OSDTree:
+    def __init__(self, data: str) -> None:
+        self.osd_tree = json.loads(data)
+
+    def iter_osd(self) -> Iterator[Dict[str, Any]]:
+        for node in self.osd_tree['nodes']:
+            if node['type'] == 'osd':
+                yield node
+
+    @classmethod
+    def from_cli(cls) -> 'OSDTree':
+        return cls(subprocess.check_output("ceph osd tree -f json", shell=True, timeout=10).decode("utf8"))
+
+
+def get_osds_for_class(tree: OSDTree, cls_name: str) -> List[int]:
+    return [node['id'] for node in tree.iter_osd() if node['device_class'] == cls_name]
 
 
 def monitoring_func(stop_evt: Event, output_dir: Path, minitoring_period: int = 5):
@@ -52,7 +85,8 @@ def save_cluster_state(fpath: Path):
     run_cmd_to(fpath, "ceph report")
 
 
-def run_test(output_dir: Path, cfg: str, opts: Any, pool: str, volume: str, size: int):
+def run_test(output_dir: Path, opts: Any, pool: str, volume: str, size: int):
+    cfg = open(opts.cfg).read()
     for qd in opts.qd:
         print("Starting test with QD = {}".format(qd))
         run_dir = output_dir / str(qd)
@@ -106,25 +140,24 @@ def monitoring(output_dir: Path, monitoring_period: int) -> Generator[None, None
         th.join()
 
 
-def rebalance(output_dir: Path, cfg: str, opts: Any, pool: str, volume: str, size: int):
+def rebalance(output_dir: Path, opts: Any, pool: str, volume: str, size: int):
     times = {}
+    cfg = open(opts.cfg).read()
     curr_cfg = cfg.format(QD=opts.qd, POOL=pool, RBD=volume, SIZE=size)
     config_fl = output_dir / "cfg.fio"
     with config_fl.open("w") as fd:
         fd.write(curr_cfg)
 
-    weights_of_nodes = {}
-    osd_tree = json.loads(subprocess.check_output("ceph osd tree -f json", shell=True, timeout=10).decode("utf8"))
-    names = {"osd.{}".format(osdid): osdid for osdid in opts.osd}
+    with (output_dir / "osd_config").open("wb") as fd:
+        fd.write(subprocess.check_output(["ceph", "-n", "osd.19", "--show-config"]))
 
-    for node in osd_tree['nodes']:
-        if node['name'] in names:
-            osdid = names[node['name']]
-            assert osdid == node['id']
-            assert osdid not in weights_of_nodes
-            weights_of_nodes[osdid] = node['crush_weight']
+    #osd_tree = OSDTree.from_cli()
+    #print(names)
+    #weights_of_nodes = {node['id']: node['crush_weight'] for node in osd_tree.iter_osd() if node['name'] in names}
 
-    assert len(weights_of_nodes) == len(names)
+    names = {"osd.{}".format(osdid) for osdid in opts.osd}
+    weights_of_nodes = {osdid: 1.85199 for osdid in opts.osd}
+    assert len(weights_of_nodes) == len(names), "{}  {}".format(weights_of_nodes, names)
     mon_dir = output_dir / 'monitoring'
     mon_dir.mkdir(exist_ok=True)
     idx = 0
@@ -140,12 +173,12 @@ def rebalance(output_dir: Path, cfg: str, opts: Any, pool: str, volume: str, siz
                 subprocess.check_call(cmd, shell=True)
 
             print("Waiting for rebalance to start...")
-            while ceph_health_ok():
+            while no_recovery():
                 time.sleep(0.1)
 
             next = start
             print("Waiting for rebalance to complete.", end="", flush=True)
-            while not ceph_health_ok():
+            while not no_recovery():
                 next += opts.timeout
                 output = mon_dir / "{}.json".format(idx)
                 idx += 1
@@ -161,6 +194,33 @@ def rebalance(output_dir: Path, cfg: str, opts: Any, pool: str, volume: str, siz
 
     with (output_dir / "timings.json").open('w') as fd:
         fd.write(json.dumps(times))
+
+
+def prepare_output_dir(output_dir: str, wipe: bool) -> Path:
+    output_dir_name = tempfile.mkdtemp() if output_dir is None else output_dir
+
+    if "{DATETIME}" in output_dir_name:
+        output_dir_name = output_dir_name.format(DATETIME="{0:%Y-%m-%d_%H:%M:%S}".format(datetime.datetime.now()))
+
+    output_dir = Path(output_dir_name)
+    if output_dir and output_dir.exists():
+        if not wipe:
+            print("Error: Output dir {} already exists. Add --wipe to clear it before test".format(output_dir))
+            raise SystemExit(1)
+        shutil.rmtree(str(output_dir))
+
+    if not output_dir.exists():
+        output_dir.mkdir(parents=True)
+    return output_dir
+
+
+def get_volume_size(pool: str, volume: str) -> int:
+    for line in subprocess.check_output("rbd info {}/{}".format(pool, volume), shell=True).decode("utf-8").split("\n"):
+        if line.strip().startswith("size"):
+            _, sz_s, units, *_ = line.split()
+            return int(sz_s) * {"MB": 2 ** 20, "GB": 2 ** 30, "TB": 2 ** 40}[units]
+    print("Can't found volume name {}/{}".format(pool, volume))
+    raise SystemExit(1)
 
 
 def parse_opts(argv: List[str]) -> Any:
@@ -192,33 +252,6 @@ def parse_opts(argv: List[str]) -> Any:
     return parser.parse_args(argv)
 
 
-def prepare_output_dir(output_dir: str, wipe: bool) -> Path:
-    output_dir_name = tempfile.mkdtemp() if output_dir is None else output_dir
-
-    if "{DATETIME}" in output_dir_name:
-        output_dir_name = output_dir_name.format(DATETIME="{0:%Y-%m-%d_%H:%M:%S}".format(datetime.datetime.now()))
-
-    output_dir = Path(output_dir_name)
-    if output_dir and output_dir.exists():
-        if not wipe:
-            print("Error: Output dir {} already exists. Add --wipe to clear it before test".format(output_dir))
-            raise SystemExit(1)
-        shutil.rmtree(str(output_dir))
-
-    if not output_dir.exists():
-        output_dir.mkdir(parents=True)
-    return output_dir
-
-
-def get_volume_size(pool: str, volume: str) -> int:
-    for line in subprocess.check_output("rbd info {}/{}".format(pool, volume), shell=True).decode("utf-8").split("\n"):
-        if line.strip().startswith("size"):
-            _, sz_s, units, *_ = line.split()
-            return int(sz_s) * {"MB": 2 ** 20, "GB": 2 ** 30, "TB": 2 ** 40}[units]
-    print("Can't found volume name {}/{}".format(pool, volume))
-    raise SystemExit(1)
-
-
 def main(argv: List[str]) -> int:
     opts = parse_opts(argv)
 
@@ -238,13 +271,11 @@ def main(argv: List[str]) -> int:
     run_cmd_to(output_dir / 'rbd_info', "rbd info {}/{}".format(pool, volume))
     run_cmd_to(output_dir / 'rbd_du', "rbd du {}/{}".format(pool, volume))
 
-    cfg = open(opts.cfg).read()
-
     if opts.subparser_name == 'fio_test':
         with monitoring(output_dir, opts.monitoring_period):
-            run_test(output_dir, cfg, opts, pool, volume, size)
+            run_test(output_dir, opts, pool, volume, size)
     elif opts.subparser_name == 'rebalance':
-        rebalance(output_dir, cfg, opts, pool, volume, size)
+        rebalance(output_dir, opts, pool, volume, size)
     else:
         assert False, opts.subparser_name
 
